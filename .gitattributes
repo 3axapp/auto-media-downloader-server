@@ -1,0 +1,3 @@
+# Фикстуры — байт-точные снимки живых ответов, снятые 2026-08-24.
+/tests/fixtures/** -text
+/tests/fixtures/*.torrent binary

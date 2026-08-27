@@ -1,0 +1,11 @@
+.git
+.gitignore
+.idea
+nbproject
+vendor
+data
+docs
+tests
+cookie.txt
+.env
+.env.*

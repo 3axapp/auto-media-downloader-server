@@ -1,0 +1,10 @@
+/vendor/
+/data/
+/.idea/
+/nbproject/
+cookie.txt
+*.cookie
+.env
+.env.*
+!.env.example
+/.phpunit.cache/
