@@ -1,0 +1,128 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use React\EventLoop\Loop;
+use React\Http\HttpServer;
+use React\Socket\SocketServer;
+use Zakharov\AutoMediaDownloaderServer\Application\Api\ApiRouter;
+use Zakharov\AutoMediaDownloaderServer\Application\Bot\Commands;
+use Zakharov\AutoMediaDownloaderServer\Application\Bot\PollTelegram;
+use Zakharov\AutoMediaDownloaderServer\Application\Watcher\ExpireStaleJobs;
+use Zakharov\AutoMediaDownloaderServer\Application\Watcher\WatchEpisodes;
+use Zakharov\AutoMediaDownloaderServer\Config;
+use Zakharov\AutoMediaDownloaderServer\Domain\Feed\RssParser;
+use Zakharov\AutoMediaDownloaderServer\Domain\Release\ReleasePageParser;
+use Zakharov\AutoMediaDownloaderServer\Domain\Release\SearchRedirectParser;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Http\LostfilmClient;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Http\ReactHttpClient;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Session\ConfigCookieProvider;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Storage\BotStateRepository;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Storage\EpisodeRepository;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Storage\JobRepository;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Storage\SeriesRepository;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Storage\SqliteConnection;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Telegram\TelegramClient;
+use Zakharov\AutoMediaDownloaderServer\Infrastructure\Telegram\TelegramNotifier;
+use Zakharov\AutoMediaDownloaderServer\Support\Backoff;
+use Zakharov\AutoMediaDownloaderServer\Support\Logger;
+use Zakharov\AutoMediaDownloaderServer\Support\SystemClock;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+$log = new Logger(STDERR);
+
+try {
+    $config = Config::fromEnv($_ENV + $_SERVER + getenv());
+} catch (Throwable $e) {
+    $log->error('конфигурация неверна', ['ошибка' => $e->getMessage()]);
+
+    exit(1);
+}
+
+$clock = new SystemClock();
+$db = SqliteConnection::open($config->dbPath);
+$db->migrate();
+
+$series = new SeriesRepository($db, $clock);
+$episodes = new EpisodeRepository($db, $clock);
+$jobs = new JobRepository($db, $clock);
+$botState = new BotStateRepository($db);
+
+$http = new ReactHttpClient();
+$telegramHttp = new ReactHttpClient(timeout: 60.0);
+
+$telegram = new TelegramClient($telegramHttp, $config->telegramToken);
+$notifier = new TelegramNotifier($telegram, $config->telegramChats, $log);
+
+$lostfilm = new LostfilmClient(
+        $http,
+        new ConfigCookieProvider($config->lfSession, $config->lfSessionFile),
+        new SearchRedirectParser(),
+);
+
+$watch = new WatchEpisodes(
+        $lostfilm,
+        new RssParser(),
+        new ReleasePageParser(),
+        $series,
+        $episodes,
+        $jobs,
+        $db,
+        $notifier,
+        $config->quality,
+        $log,
+);
+
+$expire = new ExpireStaleJobs($jobs, $notifier, $log, $config->maxAttempts);
+
+$loop = Loop::get();
+
+// Источник событий 1: таймер опроса ленты.
+$running = false;
+$pass = function () use (&$running, $watch, $expire, $log): void {
+    if ($running) {
+        $log->warn('предыдущий проход ещё идёт, пропуск такта');
+
+        return;
+    }
+
+    $running = true;
+    $watch->run()->then(
+            function () use (&$running, $expire): void {
+                $running = false;
+                $expire->run();
+            },
+            function (Throwable $e) use (&$running, $log): void {
+                $running = false;
+                $log->error('проход завершился ошибкой', ['ошибка' => $e->getMessage()]);
+            },
+    );
+};
+
+
+$loop->futureTick($pass);
+$loop->addPeriodicTimer($config->rssPollInterval, $pass);
+
+// Источник событий 2: HTTP-API для скачивающего клиента.
+$api = new ApiRouter($jobs, $series, $notifier, $log, $config->apiToken, $config->leaseTtl);
+$server = new HttpServer($api);
+$socket = new SocketServer('0.0.0.0:' . $config->httpPort);
+$server->listen($socket);
+$server->on('error', function (Throwable $e) use ($log): void {
+    $log->error('ошибка HTTP-сервера', ['ошибка' => $e->getMessage()]);
+});
+
+// Источник событий 3: цепочка long-polling Telegram.
+$poll = new PollTelegram($telegram, $botState, new Commands($series, $jobs, $db), $log, new Backoff(), $loop);
+$poll->start();
+
+$log->info('демон запущен', [
+        'порт'     => $config->httpPort,
+        'интервал' => $config->rssPollInterval,
+        'качество' => $config->quality->value,
+        'база'     => $config->dbPath,
+]);
+
+$loop->run();
