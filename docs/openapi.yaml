@@ -1,0 +1,356 @@
+openapi: 3.1.0
+
+info:
+  title: auto-media-downloader
+  version: '1.0'
+  description: |
+    Исходящая очередь демона-наблюдателя LostFilm. Демон следит за лентой,
+    резолвит `.torrent` и складывает задания сюда; внешний скачивающий клиент
+    забирает их, качает и отчитывается о результате.
+
+    Байты торрента отдаются отдельным эндпоинтом, а не полем в JSON: ссылки
+    lostfilm подписаны и привязаны к сессии, удалённый клиент их не отрезолвит,
+    поэтому резолв целиком остаётся на стороне демона.
+
+    Все ответы об ошибках — JSON вида `{"error": "…"}` с текстом на русском.
+
+servers:
+  - url: "{baseUrl}"
+    description: адрес демона
+    variables:
+      baseUrl:
+        default: 'http://localhost:8080'
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: jobs
+    description: Очередь заданий на скачивание
+  - name: hooks
+    description: Обратная связь от скачивающего клиента
+  - name: service
+    description: Служебные маршруты
+
+paths:
+  /health:
+    get:
+      tags: [service]
+      summary: Проверка работоспособности
+      description: Единственный маршрут без авторизации.
+      security: []
+      responses:
+        '200':
+          description: демон работает
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+              example:
+                status: ok
+
+  /jobs:
+    get:
+      tags: [jobs]
+      summary: Забрать задания в работу
+      description: |
+        Выдаёт задания в статусе `pending`, а также `leased` с истёкшим лизингом.
+
+        Запрос не идемпотентен: тем же вызовом задания переводятся в `leased`,
+        им ставится `lease_until = now + LEASE_TTL` и увеличивается счётчик
+        `attempts`. Задание, выданное `MAX_ATTEMPTS` раз и так и не забранное,
+        демон помечает `failed` и сообщает об этом в Telegram.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Сколько заданий выдать. Значение вне диапазона зажимается
+            в `1…100`, нечисловое трактуется как `0` и потому даёт `1`.
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: список выданных заданий
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Job'
+              examples:
+                одно задание:
+                  value:
+                    - id: 42
+                      seriesId: 1136
+                      seriesName: Безумцы
+                      seriesNameEn: Mad Men
+                      season: 7
+                      episode: 6
+                      quality: MP4
+                      torrentName: Mad.Men.S07E06.720p.rus.LostFilm.TV.mp4.torrent
+                      torrentUrl: /jobs/42/torrent
+                      leaseUntil: '2026-08-24T18:40:00Z'
+                очередь пуста:
+                  value: []
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /jobs/{id}/torrent:
+    get:
+      tags: [jobs]
+      summary: Скачать файл торрента
+      description: |
+        Отдаёт сами байты `.torrent`. После `ack` байты обнуляются, и маршрут
+        начинает отвечать `404` — забирать файл нужно до подтверждения.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: |
+            Файл торрента. Заголовок `Content-Disposition` несёт имя вида
+            `Mad.Men.S07E06.720p.rus.LostFilm.TV.mp4.torrent`.
+          headers:
+            Content-Disposition:
+              description: attachment с именем файла
+              schema:
+                type: string
+                examples:
+                  - attachment; filename="Mad.Men.S07E06.720p.rus.LostFilm.TV.mp4.torrent"
+          content:
+            application/x-bittorrent:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Задания нет либо байты уже обнулены — после `ack`, после отчёта
+            через `/hooks/complete` или после того, как демон пометил задание
+            `failed`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: байты торрента недоступны
+
+  /jobs/{id}/ack:
+    post:
+      tags: [jobs]
+      summary: Подтвердить получение торрента
+      description: |
+        Означает «файл у меня», а не «скачано». Задание переходит в `acked`,
+        байты обнуляются, переотдача исключается. Отчёт о самом скачивании
+        приходит позже, отдельным вызовом `/hooks/complete`.
+
+        Разделение намеренное: схлопывание держало бы лизинг открытым всё
+        время скачивания.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '204':
+          description: подтверждено
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: задание не найдено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: задание не найдено
+
+  /hooks/complete:
+    post:
+      tags: [hooks]
+      summary: Отчитаться о результате скачивания
+      description: |
+        Приходит часами позже выдачи. Демон помечает задание `done` либо
+        `failed` и шлёт уведомление в Telegram — при успехе с постером сериала.
+
+        Переотдачи при `error` не происходит: торрент клиент получил, проблема
+        на его стороне.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteRequest'
+            examples:
+              успех:
+                value:
+                  jobId: 42
+                  status: ok
+                  path: /volume1/media/Mad Men/S07E06.mp4
+              ошибка:
+                value:
+                  jobId: 42
+                  status: error
+                  error: нет места на диске
+      responses:
+        '204':
+          description: отчёт принят
+        '400':
+          description: |
+            Тело не разбирается как JSON, либо `jobId` не положительное целое,
+            либо `status` не `ok` и не `error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                не JSON:
+                  value:
+                    error: тело запроса не является JSON
+                нет полей:
+                  value:
+                    error: ожидались поля jobId и status (ok|error)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Задания с таким `jobId` нет. Штатная ситуация, а не сбой: сериал
+            могли снять со слежения командой `/disable`, и незавершённые
+            задания по нему удалены. Скачивание на стороне клиента при этом
+            уже не остановить — ответ просто сообщает, что отчёт учитывать
+            некуда.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: задание не найдено
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Значение переменной окружения `API_TOKEN`.
+
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор задания из `GET /jobs`.
+      schema:
+        type: integer
+        minimum: 1
+      example: 42
+
+  responses:
+    Unauthorized:
+      description: заголовок `Authorization` отсутствует или токен не совпал
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: 'нужен Authorization: Bearer <API_TOKEN>'
+
+  schemas:
+    Job:
+      type: object
+      required:
+        - id
+        - seriesId
+        - seriesName
+        - seriesNameEn
+        - season
+        - episode
+        - quality
+        - torrentName
+        - torrentUrl
+        - leaseUntil
+      properties:
+        id:
+          type: integer
+          examples: [42]
+        seriesId:
+          type: integer
+          description: Идентификатор сериала на lostfilm.
+          examples: [1136]
+        seriesName:
+          type: string
+          description: Русское название. Пустая строка, если сериал ещё не попал в справочник.
+          examples: [Безумцы]
+        seriesNameEn:
+          type: string
+          description: Английское название. Пустая строка на тех же основаниях.
+          examples: [Mad Men]
+        season:
+          type: integer
+          examples: [7]
+        episode:
+          type: integer
+          examples: [6]
+        quality:
+          $ref: '#/components/schemas/Quality'
+        torrentName:
+          type: string
+          description: Имя файла из `Content-Disposition` страницы релиза.
+          examples: [Mad.Men.S07E06.720p.rus.LostFilm.TV.mp4.torrent]
+        torrentUrl:
+          type: string
+          description: Путь для скачивания байтов, относительно того же хоста.
+          examples: [/jobs/42/torrent]
+        leaseUntil:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент истечения лизинга, UTC. После него задание считается
+            брошенным и будет выдано снова.
+          examples: ['2026-08-24T18:40:00Z']
+
+    Quality:
+      type: string
+      description: |
+        Метка качества, по которой выбран релиз. Задаётся переменной
+        окружения `QUALITY` и одинакова для всех заданий демона.
+      enum: [SD, '1080', MP4]
+
+    CompleteRequest:
+      type: object
+      required: [jobId, status]
+      properties:
+        jobId:
+          type: integer
+          minimum: 1
+          description: Идентификатор задания.
+          examples: [42]
+        status:
+          type: string
+          enum: [ok, error]
+          description: '`ok` — скачано, `error` — не удалось.'
+        path:
+          type: string
+          description: |
+            Куда клиент положил файл. Демон значение не использует —
+            поле остаётся для диагностики на стороне клиента.
+          examples: ['/volume1/media/Mad Men/S07E06.mp4']
+        error:
+          type: string
+          description: |
+            Описание сбоя. Попадает в уведомление Telegram; при отсутствии
+            подставляется «без описания».
+          examples: [нет места на диске]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Текст ошибки на русском.
