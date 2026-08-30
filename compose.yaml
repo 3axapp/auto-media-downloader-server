@@ -1,6 +1,6 @@
 services:
   app:
-    build: tests
+    build: .
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-8080}:8080"
